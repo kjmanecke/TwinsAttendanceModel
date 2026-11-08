@@ -1,0 +1,209 @@
+---
+title: "Twins Business Analytics Project Modeling"
+author: "Katie Manecke"
+format: html
+editor: visual
+---
+
+This file builds and evaluates four predictive models for Twins home game attendance. The modeling process starts with a full linear regression and iteratively removes non-significant variables, then tests a log-linear transformation, a decision tree, and a tuned random forest. Models are compared using 10-fold cross validation
+```{r}
+attendance_model_data <- readRDS("attendance_model_data.rds")
+```
+
+```{r}
+library(caret)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(Metrics)
+```
+
+```{r}
+# The first model includes all candidate variables to establish a baseline and identify which are significant. is_weekend is included here but will be dropped due to perfect collinearity with day_of_week, which R flags as a singularity. Twins_dlgb and Opp_podds are also included initially but removed in subsequent models due to non-significance and multicollinearity with other performance variables identified in the EDA
+original_lm <- lm(TotalPaidAttendance ~ month + day_of_week + opp_category + Temperature_F + promo_flag + theme_flag + is_weekend + is_night_game + Twins_dlgb + Twins_win_percentage + Twins_podds + Opp_win_percentage + Opp_podds, data = attendance_model_data)
+
+summary(original_lm)
+```
+
+
+```{r}
+# is_weekend, Twins_dlgb, and Opp_podds are removed. Temperature_F remains but will be evaluated against month in the next step since the two are correlated at 0.50
+second_lm <- lm(TotalPaidAttendance ~ month + day_of_week + opp_category + Temperature_F + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = attendance_model_data)
+
+summary(second_lm)
+```
+
+```{r}
+# Temperature_F is dropped in favor of month. Despite temperature being individually significant when month is excluded, the model explains significantly more variance with month (R-squared 0.4982 vs 0.4333) because month captures seasonal attendance patterns beyond just weather including school schedules and fan behavior. This is the final linear regression model
+lm_model <- lm(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = attendance_model_data)
+
+summary(lm_model)
+```
+
+
+```{r}
+# A log transformation of the outcome variable is tested to account for the possibility that predictors affect attendance proportionally rather than in raw fan counts. This improves R-squared from 0.4982 to 0.5416 confirming the log-linear specification fits the data better.
+log_model <- lm(log(TotalPaidAttendance) ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = attendance_model_data)
+
+summary(log_model)
+```
+
+
+```{r}
+# A decision tree provides an interpretable visual of how the model splits the data into attendance predictions. While less accurate than the random forest it illustrates which variables are most important and at what thresholds they affect attendance.
+dt_model <- rpart(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = attendance_model_data, method = "anova")
+
+rpart.plot(dt_model, type = 4, extra = 101, roundint = FALSE)
+```
+The first split on month immediately separates April games (averaging 18,000) from the rest of the season (averaging 26,000). Within April, night games and then promo flag further split attendance with April day games with promos averaging close to the rest of the season at 24,000. For non-April games the promo flag is the first split, with promo games averaging 28,000 vs 24,000 without — confirming promotions are the single most controllable driver of attendance outside of month. Within the non-promo games postseason odds above 87% push average attendance to 28,000. Within promo games a Twins win percentage above 60% pushes average attendance to 33,000 which is near sellout territory.
+
+```{r}
+# A random forest model builds 500 decision trees on random subsets of the data and averages their predictions. This reduces overfitting compared to a single decision tree and captures non-linear relationships and interactions between variables that linear regression cannot. importance = TRUE enables variable importance metrics to be extracted after fitting
+original_rf_model <- randomForest(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, 
+                          data = attendance_model_data,
+                          importance = TRUE,
+                          ntree = 500)
+
+# model summary
+original_rf_model
+
+# variable importance plot
+varImpPlot(original_rf_model)
+```
+The variable importance plot shows two metrics. IncMSE measures how much model accuracy drops when each variable is randomly permuted — month is by far the most important variable by this measure, with Twins_podds, day_of_week, Twins_win_percentage, and promo_flag forming a secondary cluster of similar importance. theme_flag is the least important variable. IncNodePurity measures how much each variable reduces prediction error across all 500 trees — month, Twins_win_percentage, and Twins_podds dominate here. Both metrics consistently identify month and Twins performance variables as the primary drivers of attendance, with promo_flag and day_of_week also meaningful. This is consistent with the linear model findings which adds confidence to the variable selection
+
+```{r}
+# The mtry parameter controls how many variables are randomly considered at each split in each tree. The default is the square root of the number of predictors but tuneRF searches for the optimal value by testing different options and measuring out-of-bag error
+tuneRF(dplyr::select(attendance_model_data, month, day_of_week, opp_category, promo_flag, theme_flag, 
+                is_night_game, Twins_win_percentage, Twins_podds, Opp_win_percentage),
+       attendance_model_data$TotalPaidAttendance,
+       stepFactor = 1.5,
+       improve = 0.01,
+       ntreeTry = 500)
+```
+
+
+```{r}
+# mtry = 4 produced the lowest out-of-bag error so the random forest is rerun with that value. Variance explained improves slightly from 52.83% to 53.13%
+rf_model <- randomForest(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, 
+                          data = attendance_model_data,
+                          importance = TRUE,
+                          ntree = 500,
+                          mtry = 4)
+
+# model summary
+rf_model
+
+# variable importance plot
+varImpPlot(rf_model)
+```
+
+```{r}
+# a seed is set before cross validation to ensure results are reproducible
+set.seed(2020)
+```
+
+cross validation
+```{r}
+# 10-fold cross validation splits the data into 10 equal parts, trains each model on 9 parts and tests on the remaining 1, rotating through all 10 folds. This gives a more reliable estimate of how well each model predicts on unseen data than a single train-test split
+train_control <- trainControl(method = "cv", number = 10)
+```
+
+
+```{r}
+# Each model is retrained using the same formula and variables through the caret train() function with 10-fold cross validation. The method argument specifies the model type. The log-linear model uses log(TotalPaidAttendance) as the outcome so its RMSE will be in log units and cannot be directly compared to the other three models on that metric alone
+cv_lm <- train(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage,
+               data = attendance_model_data,
+               method = "lm",
+               trControl = train_control)
+```
+
+
+```{r}
+cv_log <- train(log(TotalPaidAttendance) ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage,
+               data = attendance_model_data,
+               method = "lm",
+               trControl = train_control)
+```
+
+
+```{r}
+cv_dt <- train(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage,
+               data = attendance_model_data,
+               method = "rpart",
+               trControl = train_control)
+```
+
+
+```{r}
+cv_rf <- train(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage,
+               data = attendance_model_data,
+               method = "rf",
+               trControl = train_control)
+```
+
+
+```{r}
+# The resamples() function collects results across all four models and summary() displays RMSE, MAE, and R-squared for each fold and their averages. The random forest has the lowest RMSE at 4,368 fans per game and the highest R-squared at 0.547, making it the best performing model
+results <- resamples(list(
+  Linear = cv_lm,
+  Log_Linear = cv_log,
+  Decision_Tree = cv_dt,
+  Random_Forest = cv_rf
+))
+
+summary(results)
+```
+The random forest is the best performing model with the lowest RMSE of 4,368 fans per game and the highest R-squared of 0.547, meaning it explains about 55% of the variance in attendance. The log-linear model has a higher R-squared than the standard linear model but its RMSE is in log units and cannot be directly compared to the other models without converting predictions back to raw attendance numbers. The decision tree is the weakest performer with the highest RMSE and lowest R-squared, which is expected since a single tree is prone to overfitting to specific splits in the training data
+
+```{r}
+# The random forest predictions are added to the dataset so they can be visualized against actual attendance values
+attendance_model_data$rf_predicted <- predict(rf_model, attendance_model_data)
+```
+
+
+```{r}
+library(tidyverse)
+
+# A prediction error column is calculated as the difference between predicted and actual attendance. Positive values mean the model overpredicted and negative values mean it underpredicted
+attendance_model_data <- attendance_model_data |>
+  mutate(rf_error = rf_predicted - TotalPaidAttendance)
+```
+
+
+```{r}
+# The predicted vs actual scatter plot shows how closely the model tracks real attendance. Points on the diagonal line represent perfect predictions. Points are colored by prediction error with red indicating overprediction and blue indicating underprediction
+ggplot(attendance_model_data, aes(x = TotalPaidAttendance, y = rf_predicted, color = rf_error)) +
+  geom_point() + 
+  geom_abline() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Predicted vs Actual Attendance", x = "Total Paid Attendance", y = "Predicted Attendance")
+```
+The model fits well in the middle range of attendance but shows a systematic pattern of overpredicting low attendance games and underpredicting high attendance games. This compression of the prediction range is common in attendance models and reflects the difficulty of capturing the special circumstances that drive near-sellout games or unusually low attendance
+
+```{r}
+saveRDS(rf_model, "rf_model.rds")
+```
+
+
+```{r}
+# Predicted vs Actual for the presentation slides
+ggplot(attendance_model_data, aes(x = TotalPaidAttendance, y = rf_predicted, color = rf_error)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(color = "#002B5C", linewidth = 1) +
+  scale_color_gradient2(low = "#4A90D9", mid = "white", high = "#D31145", midpoint = 0) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Predicted vs Actual Attendance",
+       x = "Total Paid Attendance", y = "Predicted Attendance", color = "Error") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+

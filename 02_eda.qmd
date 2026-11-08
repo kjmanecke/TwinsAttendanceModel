@@ -1,0 +1,382 @@
+---
+title: "Twins Business Analytics Project EDA"
+author: "Katie Manecke"
+format: html
+editor: visual
+---
+
+This file explores the cleaned attendance dataset through summary statistics and visualizations. The goal is to understand the distribution of the outcome variable, identify patterns in the predictor variables, and surface insights that inform the modeling approach.
+```{r}
+attendance_model_data <- readRDS("attendance_model_data.rds")
+```
+
+```{r}
+# load in libraries
+library(tidyverse)
+library(lubridate)
+library(ggcorrplot)
+library(scales)
+```
+
+```{r}
+# Starting with a high level summary of all variables to check distributions, ranges, and spot anything unexpected before visualizing
+summary(attendance_model_data)
+```
+
+```{r}
+# The distribution of total paid attendance is the first thing to examine since it is the variable being predicted. Understanding its shape helps determine whether any transformations are needed for modeling
+ggplot(attendance_model_data, aes(x = TotalPaidAttendance)) +
+  geom_histogram(binwidth = 1000, fill = "#002B5C", color = "black") +
+  labs(title = "Total Paid Attendance", x = "Total Paid Attendance", y = "Count") +
+  theme_minimal()
+```
+The distribution of total paid attendance is roughly bell-shaped and centered around 22,000 to 24,000, which aligns with the mean of 24,519 and median of 24,277 from the summary statistics. There is a slight right skew with some high attendance games pushing toward 40,000, likely driven by big promotion days or marquee opponents. The bulk of games fall between 15,000 and 30,000. The low attendance tail under 15,000 is worth noting and is almost certainly cold April weekday games with no promotional draw. The spike near 40,000 is also interesting given that Target Field capacity is approximately 38,544, meaning those games were sellouts.
+
+```{r}
+# Attendance by day of week shows whether scheduling affects how many fans show up independent of other factors
+ggplot(attendance_model_data, aes(x = day_of_week, y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("1" = "Sun", "2" = "Mon", "3" = "Tue", 
+                             "4" = "Wed", "5" = "Thu", "6" = "Fri", "7" = "Sat")) +
+  labs(title = "Attendance by Day of the Week", x = "Day of the Week", y = "Total Paid Attendance")
+```
+Attendance is consistently lower on Monday through Thursday, with Monday showing the largest drop regardless of opponent, promotions, or team performance. Friday through Sunday see a clear and meaningful uptick, representing the strongest draw days of the week.
+
+```{r}
+# Attendance by month captures seasonal patterns including weather, school schedules, and where the team stands in the standings
+ggplot(attendance_model_data, aes(x = month, y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  labs(title = "Attendance by Month", x = "Month", y = "Total Paid Attendance")
+```
+April has the lowest median attendance of any month at around 17,000, but the outliers at 35,000-39,000 are almost certainly home opener games where demand is high regardless of weather or opponent. Opening day is a unique event that does not fit normal attendance patterns and is something the model will struggle to predict accurately. March and October each have only a handful of games so their distributions are not meaningful. The broader April story is an actionable insight for the Twins — cold weather suppresses attendance throughout the month except for the home opener, which suggests pricing and promotional strategy for early season games should account for that baseline suppression rather than treating April like any other month.
+
+```{r}
+# Giveaway promotions are one of the primary business levers the Twins can control. This plot shows whether they have a measurable effect on attendance
+ggplot(attendance_model_data, aes(x = factor(promo_flag), y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("0" = "No Promo", "1" = "Promo")) +
+  labs(title = "Attendance by Promotions", x = "Promotions", y = "Total Paid Attendance")
+```
+Games with a giveaway promotion show a clear upward shift across the entire attendance distribution. The median is noticeably higher for promo games and the interquartile range shifts up as well, suggesting promotions lift attendance broadly rather than just pulling in a few extra fans at the margins.
+
+```{r}
+# Theme nights are a different type of promotion from giveaways since they often come with an additional ticket cost. This plot tests whether they drive attendance similarly to free giveaway promotions
+ggplot(attendance_model_data, aes(x = factor(theme_flag), y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("0" = "No Theme Night", "1" = "Theme Night")) +
+  labs(title = "Attendance by Theme Nights", x = "Theme Nights", y = "Total Paid Attendance")
+```
+Giveaway promos are free to the fan and drive attendance, while theme nights often come with an additional ticket cost which might offset the appeal for some fans. The medians look almost identical between theme night and no theme night games.
+
+```{r}
+# Temperature is one of the few variables fans actively consider when deciding whether to attend a game. Two versions of this plot are shown — a linear trend line first to show the overall direction, then a loess curve to capture the true shape of the relationship
+ggplot(attendance_model_data, aes(x = Temperature_F, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(title = "Temperature vs Total Paid Attendance", x = "Temperature", y = "Total Paid Attendance")
+```
+
+```{r}
+ggplot(attendance_model_data, aes(x = Temperature_F, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "loess", se = FALSE) + 
+  labs(title = "Temperature vs Total Paid Attendance", x = "Temperature", y = "Total Paid Attendance")
+```
+The loess curve reveals a sweet spot around 75-82 degrees where attendance peaks. Both cold temperatures in April and extreme heat above 85 degrees suppress attendance, suggesting the relationship is not linear and that temperature alone is not enough to explain attendance without also accounting for month.
+
+```{r}
+# Opponents are ranked by median attendance to identify which teams drive the most fan interest. This helps validate the opp_category groupings used in modeling
+ggplot(attendance_model_data, aes(x = reorder(OPPONENT, TotalPaidAttendance, median), y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Attendance by Opponent", x = "Total Paid Attendance", y = "Opponents")
+```
+Chicago Cubs, Philadelphia Phillies, and Milwaukee Brewers are the top draws reflecting strong fan bases that travel well and recent team success. Houston Astros and Los Angeles Dodgers appear near the bottom but both have very few games in the dataset due to interleague scheduling, which skews their medians and makes them unreliable comparisons. The wide variance for teams like Chicago White Sox reflects how much other factors like day of week and promotions can override the opponent effect.
+
+```{r}
+# The core research question of this project is whether playoff contention drives attendance. This scatter plot examines the relationship between the Twins daily postseason odds and attendance across all games, then filters to August and September where the playoff race is most meaningful
+ggplot(attendance_model_data, aes(x = Twins_podds, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(title = "Twins Postseason Odds vs Total Paid Attendance", x = "Twins Postseason Odds", y = "Total Paid Attendance")
+```
+
+```{r}
+attendance_model_data |>
+  filter(month == "Aug" | month == "Sep") |>
+  ggplot(aes(x = Twins_podds, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(title = "Twins Postseason Odds vs Total Paid Attendance in August and September", x = "Twins Postseason Odds", y = "Total Paid Attendance")
+```
+Even filtering to August and September, where the playoff race is most meaningful, the relationship between postseason odds and attendance remains moderate. The dense cluster near zero on the x axis represents seasons where the Twins were eliminated by late summer, and attendance within that group still varies widely. This tells an important story: even in eliminated seasons, other factors like promotions, day of week, and temperature continue to drive attendance more than playoff contention does. The Twins are not dependent on being in a pennant race to draw fans to Target Field.
+
+
+```{r}
+# Win percentage is a related but distinct measure of team performance from postseason odds. Two versions are shown: the full dataset first, then filtered to games where the Twins had played at least 10 games to remove misleading early season values where a team might be 3-0 or 0-3.
+ggplot(attendance_model_data, aes(x = Twins_win_percentage, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(title = "Twins Win Percentage vs Total Paid Attendance", x = "Twins Win Percentage", y = "Total Paid Attendance")
+```
+
+```{r}
+attendance_model_data |>
+  filter(Twins_Wins + Twins_Losses >= 10) |>
+  ggplot(aes(x = Twins_win_percentage, y = TotalPaidAttendance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(title = "Twins Win Percentage vs Total Paid Attendance with more than 10 games played", x = "Twins Win Percentage", y = "Total Paid Attendance")
+```
+
+
+```{r}
+# Adding day of week as a color dimension shows how the relationship between win percentage and attendance differs across different days of the week, and whether the day of week effect is larger or smaller than the team performance effect
+attendance_model_data |>
+  filter(Twins_Wins + Twins_Losses >= 10) |>
+  ggplot(aes(x = Twins_win_percentage, y = TotalPaidAttendance, color = day_of_week)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE) + 
+  scale_color_discrete(labels = c("1" = "Sun", "2" = "Mon", "3" = "Tue", 
+                                 "4" = "Wed", "5" = "Thu", "6" = "Fri", "7" = "Sat")) +
+  labs(title = "Twins Win Percentage vs Total Paid Attendance by Day of Week", x = "Twins Win Percentage", y = "Total Paid Attendance")
+```
+Saturday consistently has the highest attendance baseline and steepest slope, meaning fans on Saturdays are most responsive to a winning team. Monday has the lowest baseline across all win percentages confirming that day of week has a larger effect on attendance than win percentage, the lines are spread far apart vertically but all trend similarly upward
+
+```{r}
+# A correlation matrix of all numeric variables shows how strongly each predictor relates to attendance and identifies potential multicollinearity issues between predictors that could affect modeling. Given the large number of variables a focused version of this matrix is shown below using only the key predictors
+attendance_model_data |>
+  select(where(is.numeric)) |>
+  cor() |>
+  ggcorrplot(hc.order = TRUE, lab = TRUE, lab_size = 2)
+```
+
+
+```{r}
+# Narrowing the correlation matrix to key predictors makes the relationships easier to read and focuses attention on the variables most relevant to the model. The most important things to look for are the correlations with TotalPaidAttendance and any high correlations between predictors that could cause multicollinearity
+attendance_model_data |>
+  select(TotalPaidAttendance, Temperature_F, promo_flag, theme_flag, 
+         is_weekend, is_night_game, Twins_dlgb, Twins_win_percentage, Twins_podds,
+         Opp_win_percentage, Opp_podds) |>
+  cor() |>
+  ggcorrplot(hc.order = TRUE, lab = TRUE, lab_size = 3)
+```
+promo_flag (0.33), Temperature_F (0.33), and is_weekend (0.29) are the strongest individual predictors of attendance. Twins_podds (0.29) and Twins_win_percentage (0.22) show moderate relationships. theme_flag and is_night_game are both weak. On the multicollinearity side, Twins_podds and Twins_dlgb are highly correlated (0.76) suggesting only one is needed in the model, and Opp_win_percentage and Opp_podds show a similar issue (0.69)
+
+```{r}
+# Attendance by year provides important context for the full dataset. The years included span 2017-2019 and 2022-2025, skipping 2020 and 2021 due to COVID restrictions on fan attendance
+ggplot(attendance_model_data, aes(x = factor(year), y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  labs(title = "Attendance by Year", x = "Year", y = "Total Paid Attendance")
+```
+
+2019 stands out as an outlier year when the Twins set a then-record for home runs and attendance was significantly higher with much more upside in the upper range. The 2022 dip reflects fans not fully returning after COVID. The 2023 bump aligns with a playoff run that included winning a Wild Card series, while the decline in 2024 and 2025 reflects payroll cuts that reduced competitiveness and eroded fan trust in the organization's direction
+
+```{r}
+# Calculating average attendance by year to understand how overall attendance levels have shifted across the dataset. This provides important context for the modeling since year-over-year trends reflect broader organizational factors like playoff success, payroll decisions, and the post-COVID fan return that the other variables cannot fully capture
+attendance_model_data |>
+  group_by(year) |>
+  summarise(mean_attendance = mean(TotalPaidAttendance, na.rm = TRUE))
+```
+
+
+```{r}
+# To dig deeper into the core research question, the correlation between postseason odds and attendance is calculated separately for each month. This tests whether playoff contention has a stronger effect on attendance later in the season when the stakes are higher
+attendance_model_data |>
+  group_by(month) |>
+  summarise(correlation = cor(Twins_podds, TotalPaidAttendance))
+```
+April shows essentially zero correlation (-0.006) confirming that postseason odds have no meaningful relationship with attendance early in the season when it is too early for fans to care about the playoff race. The correlation grows steadily from May through July, peaking at 0.39 in July, and remains elevated through September. This confirms that playoff contention starts mattering around May and remains an important driver through the end of the season. However, correlations in the 0.30-0.39 range are moderate at best, postseason odds are roughly as important as temperature or whether it is a weekend, which is a counterintuitive finding. The Twins cannot rely solely on playoff excitement to drive attendance, and the business side has comparable levers to pull through promotions and scheduling even in down years. It is also worth noting that only three of the seven seasons in the dataset, 2017, 2019, and 2023, had meaningful playoff contention, which limits the range of postseason odds in the data and likely suppresses the measured correlation
+
+```{r}
+# March and October are excluded from the visualization due to insufficient sample sizes. A reference line at zero is added to make the near-zero April bar more visually obvious
+corr_by_month <- attendance_model_data |>
+  filter(!month %in% c("Mar", "Oct")) |>
+  group_by(month) |>
+  summarise(correlation = cor(Twins_podds, TotalPaidAttendance))
+```
+
+
+```{r}
+ggplot(corr_by_month, aes(x = month, y = correlation)) + 
+  geom_bar(fill = "steelblue", color = "white", stat = "identity") +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "Correlation Between Postseason Odds and Attendance by Month", x = "Month", y = "Correlation with Postseason Odds") +
+  theme_minimal()
+```
+
+
+```{r}
+# To test whether the effect of team performance differs between the early and late season, the data is split into two periods. Early season covers April through June and late season covers July through September
+early_season <- attendance_model_data |>
+  filter(month %in% c("Apr", "May", "Jun"))
+
+late_season <- attendance_model_data |>
+  filter(month %in% c("Jul", "Aug", "Sep"))
+```
+
+
+```{r}
+# The same linear model is run separately on the early and late season datasets to test whether the effect of postseason odds and win percentage on attendance differs between the two halves of the season
+early_lm_model <- lm(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = early_season)
+
+summary(early_lm_model)
+```
+
+```{r}
+late_lm_model <- lm(TotalPaidAttendance ~ month + day_of_week + opp_category + promo_flag + theme_flag + is_night_game + Twins_win_percentage + Twins_podds + Opp_win_percentage, data = late_season)
+
+summary(late_lm_model)
+```
+
+The results reveal a striking flip between the two periods. In the early season, postseason odds are significant (coefficient of 5,443, p = 0.007) while win percentage is not significant (p = 0.361). In the late season this completely reverses — win percentage becomes highly significant with a coefficient of 52,950 (p < 0.001) while postseason odds lose significance entirely (p = 0.410). The interpretation is that early season fans are responding to preseason expectations and optimism captured in the odds, while late season fans are reacting to what they have actually watched all year. Fans in August and September are not tracking playoff probability models, they are responding to whether the team looks good on the field
+
+```{r}
+# A binary in_contention variable is created to classify late season games as either competitive or eliminated. A threshold of 15% postseason odds is used as a reasonable cutoff for being in the playoff hunt
+late_season <- late_season |>
+  mutate(in_contention = ifelse(Twins_podds > 0.15, 1, 0))
+
+table(late_season$in_contention)
+```
+
+191 games fell in the contention category and 94 in the eliminated category, roughly a 2-to-1 split reflecting that 2017, 2019, and 2023 were all competitive seasons
+
+```{r}
+# Average and median attendance are compared between contention and eliminated games to quantify the playoff contention premium in the late season
+late_season |>
+  group_by(in_contention) |>
+  summarise(avg_attendance = mean(TotalPaidAttendance),
+            median_attendance = median(TotalPaidAttendance),
+            n = n())
+```
+Late season games where the Twins were in playoff contention averaged 27,700 fans compared to 23,645 for eliminated games, a difference of roughly 4,055 fans per game or a 17% attendance premium for playoff contention
+
+```{r}
+# The distribution of attendance for contention vs eliminated late season games visualizes this premium and shows whether the difference is consistent across games or driven by a few outliers
+ggplot(late_season, aes(x = factor(in_contention), y = TotalPaidAttendance)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("0" = "Eliminated", "1" = "Contention")) +
+  labs(title = "Late Season Attendance by Playoff Contention", x = "Playoff Status", y = "Total Paid Attendance")
+```
+The contention distribution is noticeably higher with the entire box shifted upward, confirming the attendance premium is consistent rather than driven by outliers. The eliminated games show a tighter, lower distribution with one notable outlier at the bottom.
+
+
+### Styling the graphs for the presentation
+```{r}
+ggplot(attendance_model_data, aes(x = factor(promo_flag), y = TotalPaidAttendance)) +
+  geom_boxplot(fill = c("#E8EEF4", "#D31145"), color = "#002B5C", width = 0.5) +
+  scale_x_discrete(labels = c("0" = "No Promo", "1" = "Promo")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Attendance by Promotion", x = "", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+# 1. Attendance by Month
+ggplot(attendance_model_data, aes(x = month, y = TotalPaidAttendance)) +
+  geom_boxplot(fill = "#E8EEF4", color = "#002B5C", width = 0.6) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Attendance by Month", x = "", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# 2. Attendance by Day of Week
+ggplot(attendance_model_data, aes(x = day_of_week, y = TotalPaidAttendance)) +
+  geom_boxplot(fill = "#E8EEF4", color = "#002B5C", width = 0.6) +
+  scale_x_discrete(labels = c("1" = "Sun", "2" = "Mon", "3" = "Tue",
+                               "4" = "Wed", "5" = "Thu", "6" = "Fri", "7" = "Sat")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Attendance by Day of Week", x = "", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# 3. Attendance by Theme Night
+ggplot(attendance_model_data, aes(x = factor(theme_flag), y = TotalPaidAttendance)) +
+  geom_boxplot(fill = c("#E8EEF4", "#D31145"), color = "#002B5C", width = 0.5) +
+  scale_x_discrete(labels = c("0" = "No Theme Night", "1" = "Theme Night")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Attendance by Theme Night", x = "", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# 4. Temperature vs Attendance (loess)
+ggplot(attendance_model_data, aes(x = Temperature_F, y = TotalPaidAttendance)) +
+  geom_point(color = "#002B5C", alpha = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#D31145", linewidth = 1.2) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Temperature vs Total Paid Attendance", x = "Temperature (°F)", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.minor = element_blank()
+  )
+
+# 5. Attendance by Opponent
+ggplot(attendance_model_data, aes(x = reorder(OPPONENT, TotalPaidAttendance, median), y = TotalPaidAttendance)) +
+  geom_boxplot(fill = "#E8EEF4", color = "#002B5C", width = 0.6) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Attendance by Opponent", x = "", y = "Total Paid Attendance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 11, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# 6. Win Percentage by Day of Week
+attendance_model_data |>
+  filter(Twins_Wins + Twins_Losses >= 10) |>
+  ggplot(aes(x = Twins_win_percentage, y = TotalPaidAttendance, color = day_of_week)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  scale_color_brewer(palette = "Dark2",
+                   labels = c("1" = "Sun", "2" = "Mon", "3" = "Tue",
+                              "4" = "Wed", "5" = "Thu", "6" = "Fri", "7" = "Sat")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Win Percentage vs Attendance by Day of Week",
+       x = "Twins Win Percentage", y = "Total Paid Attendance", color = "Day") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#002B5C"),
+    axis.text = element_text(size = 12, color = "#4A4A4A"),
+    axis.title = element_text(size = 12, color = "#4A4A4A"),
+    legend.title = element_text(color = "#002B5C", face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+summary(attendance_model_data)
+```
+

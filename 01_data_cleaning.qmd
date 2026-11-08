@@ -1,0 +1,316 @@
+---
+title: "Twins Business Analytics Project Data Cleaning"
+author: "Katie Manecke"
+format: html
+editor: visual
+---
+
+This file covers the data cleaning and preparation process for the Twins attendance prediction model. Three datasets were provided by the Minnesota Twins organization: game-level attendance and promotional data, game temperature data, and daily team performance data. The goal of this section is to clean each dataset individually and then join them into a single analysis-ready dataset
+
+```{r}
+# load in libraries
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(lubridate)
+```
+
+The TwinsAttendance file is read in with a timezone fix applied immediately at import. The raw DATETIME column is stored in UTC by Excel but represents Central time, so force_tz() relabels it as America/Chicago without shifting the clock values
+```{r}
+# load in files
+TwinsAttendance <- read_excel("MN Twins Attendance.xlsx") |>
+  mutate(DATETIME = force_tz(DATETIME, tzone = "America/Chicago"))
+GameTemp <- read_excel("Game Temperature.xlsx")
+TeamPerformance <- read_excel("Team Performance.xlsx")
+```
+
+```{r}
+# Checking the first few DATETIME values to confirm the timezone fix worked correctly before proceeding with feature engineering.
+head(TwinsAttendance$DATETIME)
+```
+
+
+```{r}
+## creating an excel file that i can share with AI that doesn't give away the confidential information
+#TeamPerformance_share <- TeamPerformance %>%
+  #select(-c(podds, podds_ds, podds_div, podds_wc))  # replace with the actual column names
+
+#library(writexl)
+#write_xlsx(TeamPerformance_share, "TeamPerformance_share.xlsx")
+```
+
+
+```{r}
+# The create_features function handles all feature engineering on the attendance dataset. It renames the attendance column for cleaner reference, extracts date and time components from DATETIME, and creates several new variables used in modeling. is_night_game flags games starting at 6pm or later. month and day_of_week capture seasonal and weekly patterns. is_weekend flags Friday, Saturday, and Sunday games. opp_category groups opponents into three tiers based on historical draw: divisional rivals, high attendance opponents like the Cubs and Yankees, and all others. promo_flag and theme_flag convert the messy raw promo and theme night text columns into clean binary indicators
+create_features <- function(df) {
+  # rename column
+  names(df)[names(df) == "TOTAL PAID ATTENDANCE"] <- "TotalPaidAttendance"
+  
+  df %>%
+    mutate(
+      # extract date & time
+      Date = as.Date(DATETIME, tz = "America/Chicago"),
+      time = format(DATETIME, "%H:%M"),
+      game_hour = hour(DATETIME),
+      is_night_game = if_else(game_hour >= 18, 1, 0),
+      
+      # calendar features
+      month = factor(month(DATETIME), 
+               levels = 3:10, 
+               labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct")),
+      day_of_week = as.factor(wday(DATETIME, label = FALSE)),
+      is_weekend = ifelse(day_of_week %in% c(6, 7, 1), 1, 0),
+      
+      # opponent categories
+      opp_category = case_when(
+        OPPONENT %in% c("Kansas City Royals", "Detroit Tigers", "Chicago White Sox", "Cleveland Guardians") ~ "Divisional",
+        OPPONENT %in% c("Boston Red Sox", "New York Yankees", "Milwaukee Brewers", "Philadelphia Phillies", "Toronto Blue Jays", "Chicago Cubs", "Los Angeles Dodgers") ~ "High_Attendance",
+        TRUE ~ "Other"
+      ),
+      
+      # binary flags
+      promo_flag = ifelse(!is.na(`GA PROMO`) & str_trim(`GA PROMO`) != "", 1, 0),
+      theme_flag = ifelse(!is.na(`THEME EVENT`) & str_trim(`THEME EVENT`) != "", 1, 0)
+    )
+}
+
+TwinsAttendance <- create_features(TwinsAttendance)
+
+# Checking the first few rows to confirm the new columns were created correctly before moving on to the opponent lookup
+head(TwinsAttendance)
+```
+
+```{r}
+# Before joining the datasets, the opponent names in TwinsAttendance need to be matched to the team abbreviations used in TeamPerformance. This check confirms what format each dataset uses so a lookup table can be built to bridge them
+
+# check opponent names in TwinsAttendance
+unique(TwinsAttendance$OPPONENT)
+
+# check team abbreviations in TeamPerformance
+unique(TeamPerformance$team)
+```
+
+```{r}
+# A named vector maps each opponent's full name to their standard three-letter abbreviation used in TeamPerformance. This is then applied in a single mutate call to create a new opp_abbr column in TwinsAttendance
+opponent_lookup <- c(
+  "Kansas City Royals" = "KCR",
+  "Chicago White Sox" = "CHW",
+  "Cleveland Guardians" = "CLE",
+  "Detroit Tigers" = "DET",
+  "Athletics" = "ATH",
+  "Boston Red Sox" = "BOS",
+  "Colorado Rockies" = "COL",
+  "Tampa Bay Rays" = "TBR",
+  "Houston Astros" = "HOU",
+  "Seattle Mariners" = "SEA",
+  "Los Angeles Angels" = "LAA",
+  "Baltimore Orioles" = "BAL",
+  "New York Yankees" = "NYY",
+  "Texas Rangers" = "TEX",
+  "Milwaukee Brewers" = "MIL",
+  "Arizona Diamondbacks" = "ARI",
+  "San Diego Padres" = "SDP",
+  "Toronto Blue Jays" = "TOR",
+  "Cincinnati Reds" = "CIN",
+  "St. Louis Cardinals" = "STL",
+  "Pittsburgh Pirates" = "PIT",
+  "New York Mets" = "NYM",
+  "Atlanta Braves" = "ATL",
+  "Washington Nationals" = "WSN",
+  "Los Angeles Dodgers" = "LAD",
+  "San Francisco Giants" = "SFG",
+  "Chicago Cubs" = "CHC",
+  "Philadelphia Phillies" = "PHI",
+  "Miami Marlins" = "MIA"
+)
+
+TwinsAttendance <- TwinsAttendance |>
+  mutate(opp_abbr = opponent_lookup[OPPONENT])
+```
+
+```{r}
+# Confirming that every opponent was successfully matched by checking for any NAs in the new opp_abbr column. A result of 0 means all 29 opponents were matched correctly
+sum(is.na(TwinsAttendance$opp_abbr))
+```
+
+
+```{r}
+# The GameTemp dataset requires three fixes before joining. The Event_Datetime column is stored as a string with a T separator between date and time, so ymd_hms() parses it into a proper datetime object in Central time. Event_Date is converted from POSIXct to a plain Date. A clean Event_Time column is extracted from Event_Datetime in HH:MM format. This is necessary because GameTemp contains doubleheader dates where two games were played on the same day at different times, so the join to TwinsAttendance must be done on both date and time to correctly match each game to its temperature
+GameTemp <- GameTemp |>
+  mutate(Event_Datetime = ymd_hms(Event_Datetime, tz = "America/Chicago")) |>
+  mutate(Event_Date = as.Date(Event_Date)) |>
+  mutate(Event_Time = format(Event_Datetime, "%H:%M"))
+```
+
+```{r}
+#Confirming the three columns look correct before joining
+head(GameTemp[, c("Event_Datetime", "Event_Date", "Event_Time")])
+```
+
+
+```{r}
+# TeamPerformance only needs its date column converted from POSIXct to a plain Date to match the format used in the other datasets
+TeamPerformance <- TeamPerformance |>
+  mutate(date = as.Date(date))
+```
+
+```{r}
+# TeamPerformance contains daily records for all 30 MLB teams. To join Twins-specific performance stats to each home game, the dataset is filtered to only Minnesota rows. A separate opponent slice will be created by renaming the columns and joining on both date and opponent abbreviation
+Twins_Performance <- TeamPerformance |> 
+  filter(team == "MIN")
+```
+
+
+
+```{r}
+# The first join adds temperature data to the attendance dataset. A left join is used throughout so all 562 Twins home games are retained regardless of whether a match is found in the other datasets. The join is done on both date and time rather than date alone to correctly handle doubleheader games where two games were played on the same day at different times. The row count confirms no duplicate rows were created and the NA check identifies any games that did not get a temperature matched
+attendance_temp_combo <- TwinsAttendance |>
+  left_join(GameTemp, by = c("Date" = "Event_Date", "time" = "Event_Time"))
+
+nrow(attendance_temp_combo)
+sum(is.na(attendance_temp_combo$Temperature_F))
+```
+
+```{r}
+# Eight games did not find a match in GameTemp. These games were missing from the temperature dataset entirely rather than being a time mismatch issue. The dates and opponents are pulled to identify them so temperatures can be manually sourced from historical box scores
+attendance_temp_combo |>
+  filter(is.na(Temperature_F)) |>
+  select(Date, time, OPPONENT)
+```
+```{r}
+# Checking whether the 8 missing games exist in GameTemp at all or if it is a time mismatch issue. The filter returns zero rows confirming the games are simply absent from the dataset rather than stored under a different time
+GameTemp |> 
+  filter(Event_Date %in% as.Date(c("2022-09-13", "2024-08-28", "2024-09-10", "2024-09-25", "2025-05-19", "2025-07-10", "2025-08-14", "2025-09-02"))) |>
+  select(Event_Date, Event_Time)
+```
+
+```{r}
+# Temperatures for the 8 missing games were manually looked up from historical box scores on Baseball Reference. The case_when statement fills in each game's temperature while leaving all other rows unchanged via the TRUE ~ Temperature_F fallback
+attendance_temp_combo_updated <- attendance_temp_combo |>
+  mutate(Temperature_F = case_when(
+    Date == as.Date("2022-09-13") ~ 78,
+    Date == as.Date("2024-08-28") ~ 75,
+    Date == as.Date("2024-09-10") ~ 78,
+    Date == as.Date("2024-09-25") ~ 76,
+    Date == as.Date("2025-05-19") ~ 57,
+    Date == as.Date("2025-07-10") ~ 81,
+    Date == as.Date("2025-08-14") ~ 71,
+    Date == as.Date("2025-09-02") ~ 75,
+    TRUE ~ Temperature_F
+  ))
+```
+
+```{r}
+# Confirming the manual additions resolved all NAs. Both checks should return 562 rows and 0 NAs respectively
+nrow(attendance_temp_combo_updated)
+sum(is.na(attendance_temp_combo_updated$Temperature_F))
+```
+
+```{r}
+# Before joining, all performance columns in both datasets are renamed to distinguish Twins stats from opponent stats in the final combined dataset. Twins_ prefix is added to all Twins_Performance columns and Opp_ prefix is added to all TeamPerformance columns
+Twins_Performance <- Twins_Performance |>
+  rename(Twins_Wins = wins) |>
+  rename(Twins_Losses = losses) |>
+  rename(Twins_dlgb = dlgb) |>
+  rename(Twins_runs_scored = runs_scored) |>
+  rename(Twins_runs_allowed = runs_allowed) |>
+  rename(Twins_podds = podds) |>
+  rename(Twins_podds_ds = podds_ds) |>
+  rename(Twins_podds_div = podds_div) |>
+  rename(Twins_podds_wc = podds_wc) 
+```
+
+```{r}
+Opponents_Performance <- TeamPerformance |>
+  rename(Opp_Wins = wins) |>
+  rename(Opp_Losses = losses) |>
+  rename(Opp_dlgb = dlgb) |>
+  rename(Opp_runs_scored = runs_scored) |>
+  rename(Opp_runs_allowed = runs_allowed) |>
+  rename(Opp_podds = podds) |>
+  rename(Opp_podds_ds = podds_ds) |>
+  rename(Opp_podds_div = podds_div) |>
+  rename(Opp_podds_wc = podds_wc) 
+```
+
+
+```{r}
+# Twins performance stats are joined to the attendance data on date. Since Twins_Performance only contains Minnesota rows, every home game date will find exactly one matching row with the Twins standings as of that day
+attendance_twins_performance <- attendance_temp_combo_updated |>
+  left_join(Twins_Performance, by = c("Date" = "date"))
+```
+
+
+```{r}
+# Confirming the Twins performance join worked correctly. Row count should still be 562 and both NA checks should return 0
+nrow(attendance_twins_performance)
+sum(is.na(attendance_twins_performance$Twins_Wins))
+sum(is.na(attendance_twins_performance$Temperature_F))
+```
+
+
+```{r}
+# The last join adds opponent performance stats. This join uses both date and opponent abbreviation so each game pulls the correct opponent's standings on that specific day rather than just any team's stats
+attendance_model_data <- attendance_twins_performance |>
+  left_join(Opponents_Performance, by = c("Date" = "date", "opp_abbr" = "team"))
+```
+
+```{r}
+# Final confirmation that all three datasets joined cleanly with 562 rows and no NAs in the key columns
+nrow(attendance_model_data)
+sum(is.na(attendance_model_data$Opp_Wins))
+sum(is.na(attendance_model_data$Temperature_F))
+```
+
+```{r}
+# After joining all three datasets, two columns need to be cleaned up. The join created two year columns (year.x from Twins_Performance and year.y from Opponents_Performance) so year.y is dropped and year.x is renamed to year. The team column which just contains MIN for every row is also dropped since it adds no information
+attendance_model_data <- attendance_model_data |>
+  select(-year.y, -team) |>
+  rename(year = year.x) 
+```
+
+```{r}
+# Win percentage is calculated for both the Twins and their opponent by dividing wins by total games played. It is rounded to three decimal places to match standard baseball convention
+attendance_model_data <- attendance_model_data |>
+  mutate(Twins_win_percentage = round(Twins_Wins / (Twins_Wins + Twins_Losses), 3)) |>
+  mutate(Opp_win_percentage = round(Opp_Wins / (Opp_Wins + Opp_Losses), 3))
+```
+
+```{r}
+# Confirming the win percentage calculations look correct before moving on to final cleanup
+head(attendance_model_data[, c("Twins_Wins", "Twins_Losses", "Twins_win_percentage",
+                                "Opp_Wins", "Opp_Losses", "Opp_win_percentage")])
+```
+
+```{r}
+# Checking for NAs across the full joined dataset before final cleanup to identify any remaining issues
+colSums(is.na(attendance_model_data))
+```
+
+```{r}
+# Several columns are dropped for three reasons. Season_ID, Season_Int, Event_Code, and Event_Datetime are GameTemp identifiers that are not needed for modeling. DewPoint_F and Humidity are dropped because temperature already captures the weather effect on attendance, fans make game attendance decisions based on temperature not dew point, and the 8 missing games would require additional manual lookups for these columns
+attendance_model_data <- attendance_model_data |>
+  select(-Season_ID, -Season_Int, -Event_Code, -Event_Datetime, -DewPoint_F, -Humidity)
+```
+
+```{r}
+# The raw DATETIME, GA PROMO, THEME EVENT, and time columns are dropped since they have been replaced by cleaner engineered features. opp_abbr is also dropped since OPPONENT already identifies the team and was kept for display purposes in the Shiny app
+attendance_model_data <- attendance_model_data |>
+  select(-DATETIME, -'GA PROMO', -'THEME EVENT', -time, -opp_abbr)
+```
+
+```{r}
+# Final NA check confirming the cleaned dataset is complete with no missing values
+colSums(is.na(attendance_model_data))
+```
+
+```{r}
+# Final check of the dataset structure confirming column types, variable names, and dimensions before saving
+str(attendance_model_data)
+```
+
+```{r}
+# The cleaned dataset is saved as an RDS file which preserves all column types exactly, including factor levels and date formats, so it can be loaded directly into the EDA and modeling files without any additional cleaning steps
+saveRDS(attendance_model_data, "attendance_model_data.rds")
+```
+
